@@ -6,6 +6,30 @@
     <title>My Google AI Studio App</title>
   </head>
   <body>
+    <script>
+      (function() {
+        if (typeof window !== 'undefined') {
+          const originalFetch = window.fetch;
+          if (!originalFetch) return;
+          
+          function defineFetch(obj) {
+            try {
+              Object.defineProperty(obj, 'fetch', {
+                get: () => originalFetch,
+                set: () => { 
+                  console.warn('System: Prevented an attempt to overwrite fetch to avoid TypeError.');
+                },
+                configurable: true,
+                enumerable: true
+              });
+            } catch (e) {}
+          }
+
+          defineFetch(window);
+          if (typeof globalThis !== 'undefined') defineFetch(globalThis);
+        }
+      })();
+    </script>
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>

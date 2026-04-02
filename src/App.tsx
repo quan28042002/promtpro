@@ -9,6 +9,7 @@ import { Upload, Image as ImageIcon, Loader2, Copy, Check, Sparkles, AlertCircle
 import Markdown from 'react-markdown';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
+import { motion } from 'motion/react';
 
 /** Utility for Tailwind class merging */
 function cn(...inputs: ClassValue[]) {
@@ -194,10 +195,38 @@ export default function App() {
   const [selectedIndex, setSelectedIndex] = useState<number | null>(null);
   const [loading, setLoading] = useState(false);
   const [results, setResults] = useState<Record<number, string>>({});
+  const [failedIndices, setFailedIndices] = useState<number[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
   const [showPromptEditor, setShowPromptEditor] = useState(false);
-  const [systemPrompt, setSystemPrompt] = useState(SYSTEM_INSTRUCTION);
+  const [systemPrompt, setSystemPrompt] = useState(() => {
+    try {
+      const saved = localStorage.getItem('system_prompt');
+      return saved || SYSTEM_INSTRUCTION;
+    } catch (e) {
+      return SYSTEM_INSTRUCTION;
+    }
+  });
+
+  // Explicit save function
+  const saveSystemPrompt = (newPrompt: string) => {
+    setSystemPrompt(newPrompt);
+    try {
+      localStorage.setItem('system_prompt', newPrompt);
+    } catch (e) {
+      console.error('Failed to save to localStorage:', e);
+    }
+  };
+
+  // Save system prompt to localStorage when it changes (auto-save)
+  React.useEffect(() => {
+    try {
+      localStorage.setItem('system_prompt', systemPrompt);
+    } catch (e) {
+      // Silent fail for auto-save
+    }
+  }, [systemPrompt]);
+
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const handleImageUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -236,10 +265,25 @@ export default function App() {
       }
       return updated;
     });
-    // Also remove result if exists
-    const newResults = { ...results };
-    delete newResults[index];
-    setResults(newResults);
+    // Also remove result and shift keys if exists
+    setResults(prev => {
+      const newResults: Record<number, string> = {};
+      Object.entries(prev).forEach(([key, value]) => {
+        const k = parseInt(key);
+        if (k < index) {
+          newResults[k] = value;
+        } else if (k > index) {
+          newResults[k - 1] = value;
+        }
+      });
+      return newResults;
+    });
+    
+    // Update failedIndices
+    setFailedIndices(prev => {
+      const filtered = prev.filter(i => i !== index);
+      return filtered.map(i => i > index ? i - 1 : i);
+    });
   };
 
   const generateAllPrompts = async () => {
@@ -247,52 +291,73 @@ export default function App() {
 
     setLoading(true);
     setError(null);
+    setFailedIndices([]);
 
     // Process images one by one
     for (let i = 0; i < images.length; i++) {
-      // Skip if already has result and we're not re-running (optional logic)
-      // For now, let's process all to be sure
-      
-      setSelectedIndex(i); // Focus on current image being processed
-      setResults(prev => ({ ...prev, [i]: "" }));
-
-      try {
-        const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-        const model = "gemini-3-flash-preview";
-        
-        const imageData = images[i];
-        const base64Data = imageData.split(',')[1];
-        const mimeType = imageData.split(';')[0].split(':')[1];
-
-        const responseStream = await ai.models.generateContentStream({
-          model: model,
-          contents: [
-            {
-              parts: [
-                { text: "Hãy phân tích ảnh này và tạo 5 prompt theo đúng quy trình đã được thiết lập." },
-                { inlineData: { data: base64Data, mimeType } }
-              ]
-            }
-          ],
-          config: {
-            systemInstruction: systemPrompt,
-            temperature: 0.4,
-          }
-        });
-
-        let fullText = "";
-        for await (const chunk of responseStream) {
-          const chunkText = chunk.text || "";
-          fullText += chunkText;
-          setResults(prev => ({ ...prev, [i]: fullText }));
-        }
-      } catch (err) {
-        console.error(`Error processing image ${i}:`, err);
-        setError(`Lỗi khi xử lý ảnh #${i + 1}. Tiếp tục với các ảnh khác...`);
-      }
+      await processImage(i);
     }
     
     setLoading(false);
+  };
+
+  const retryFailedPrompts = async () => {
+    if (failedIndices.length === 0) return;
+
+    const toRetry = [...failedIndices];
+    setLoading(true);
+    setError(null);
+    setFailedIndices([]); // Clear current failures as we retry them
+
+    for (const i of toRetry) {
+      await processImage(i);
+    }
+
+    setLoading(false);
+  };
+
+  const processImage = async (i: number) => {
+    setSelectedIndex(i); // Focus on current image being processed
+    setResults(prev => ({ ...prev, [i]: "" }));
+
+    try {
+      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+      const model = "gemini-3-flash-preview";
+      
+      const imageData = images[i];
+      const base64Data = imageData.split(',')[1];
+      const mimeType = imageData.split(';')[0].split(':')[1];
+
+      const responseStream = await ai.models.generateContentStream({
+        model: model,
+        contents: [
+          {
+            parts: [
+              { text: "Hãy phân tích ảnh này và tạo 5 prompt theo đúng quy trình đã được thiết lập." },
+              { inlineData: { data: base64Data, mimeType } }
+            ]
+          }
+        ],
+        config: {
+          systemInstruction: systemPrompt,
+          temperature: 0.4,
+        }
+      });
+
+      let fullText = "";
+      for await (const chunk of responseStream) {
+        const chunkText = chunk.text || "";
+        fullText += chunkText;
+        setResults(prev => ({ ...prev, [i]: fullText }));
+      }
+      
+      // If we got here, it succeeded, so ensure it's not in failedIndices
+      setFailedIndices(prev => prev.filter(idx => idx !== i));
+    } catch (err) {
+      console.error(`Error processing image ${i}:`, err);
+      setFailedIndices(prev => [...new Set([...prev, i])]);
+      setError(`Lỗi khi xử lý một số ảnh. Bạn có thể thử lại các ảnh bị lỗi.`);
+    }
   };
 
   const currentResult = selectedIndex !== null ? results[selectedIndex] : null;
@@ -342,25 +407,51 @@ export default function App() {
   return (
     <div className="min-h-screen bg-[#F8F9FA] text-[#1A1A1A] font-sans selection:bg-orange-100">
       {/* Header */}
-      <header className="border-b border-gray-200 bg-white sticky top-0 z-10">
-        <div className="max-w-7xl mx-auto px-4 h-16 flex items-center justify-between">
-          <div className="flex items-center gap-2">
-            <div className="w-8 h-8 bg-orange-500 rounded-lg flex items-center justify-center">
-              <Sparkles className="text-white w-5 h-5" />
-            </div>
-            <h1 className="font-bold text-xl tracking-tight">AdCreative AI <span className="text-orange-500">Pro</span></h1>
+      <header className="border-b border-gray-200 bg-white sticky top-0 z-10 shadow-sm">
+        <div className="max-w-7xl mx-auto px-4 h-24 flex items-center justify-between">
+          <div className="flex-1 hidden sm:flex items-center">
+            {/* Left side empty for balance */}
           </div>
-          <div className="flex items-center gap-4">
-            <div className="text-xs font-mono text-gray-400 uppercase tracking-widest hidden sm:block">
-              Professional Prompt Engineering Tool
+          
+          <motion.div 
+            initial={{ opacity: 0, y: -20 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ duration: 0.5, ease: "easeOut" }}
+            className="flex flex-col items-center gap-1"
+          >
+            <div className="flex items-center gap-4">
+              <motion.div 
+                whileHover={{ scale: 1.1, rotate: 10 }}
+                className="w-12 h-12 bg-gradient-to-br from-orange-400 to-orange-600 rounded-2xl flex items-center justify-center shadow-xl shadow-orange-200"
+              >
+                <Sparkles className="text-white w-7 h-7" />
+              </motion.div>
+              <motion.h1 
+                className="font-black text-3xl sm:text-4xl tracking-tighter text-[#1A1A1A] whitespace-nowrap"
+              >
+                Master Promt <span className="text-orange-500">By Ival Nguyen</span>
+              </motion.h1>
             </div>
-            <button 
+            <motion.div 
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              transition={{ delay: 0.3, duration: 0.5 }}
+              className="text-[11px] font-mono text-gray-400 uppercase tracking-[0.3em] hidden sm:block"
+            >
+              Professional Prompt Engineering Tool
+            </motion.div>
+          </motion.div>
+
+          <div className="flex-1 flex justify-end items-center">
+            <motion.button 
+              whileHover={{ scale: 1.1, rotate: 90 }}
+              whileTap={{ scale: 0.9 }}
               onClick={() => setShowPromptEditor(true)}
-              className="p-2 hover:bg-gray-100 rounded-full transition-colors text-gray-500 hover:text-orange-500"
+              className="p-3 hover:bg-gray-100 rounded-full transition-all text-gray-500 hover:text-orange-500"
               title="Chỉnh sửa Prompt gốc"
             >
-              <Settings className="w-5 h-5" />
-            </button>
+              <Settings className="w-7 h-7" />
+            </motion.button>
           </div>
         </div>
       </header>
@@ -376,7 +467,7 @@ export default function App() {
               </div>
               <div className="flex items-center gap-2">
                 <button 
-                  onClick={() => setSystemPrompt(SYSTEM_INSTRUCTION)}
+                  onClick={() => saveSystemPrompt(SYSTEM_INSTRUCTION)}
                   className="flex items-center gap-1 px-3 py-1.5 text-xs font-bold text-gray-500 hover:text-orange-600 hover:bg-orange-50 rounded-lg transition-all"
                 >
                   <RotateCcw className="w-3.5 h-3.5" /> Khôi phục mặc định
@@ -395,14 +486,17 @@ export default function App() {
               </p>
               <textarea 
                 value={systemPrompt}
-                onChange={(e) => setSystemPrompt(e.target.value)}
+                onChange={(e) => saveSystemPrompt(e.target.value)}
                 className="w-full h-[500px] p-4 font-mono text-sm border border-gray-200 rounded-xl focus:ring-2 focus:ring-orange-500 focus:border-transparent outline-none resize-none bg-gray-50"
                 placeholder="Nhập System Instruction tại đây..."
               />
             </div>
             <div className="px-6 py-4 border-t border-gray-100 flex justify-end gap-3 bg-gray-50">
               <button 
-                onClick={() => setShowPromptEditor(false)}
+                onClick={() => {
+                  saveSystemPrompt(systemPrompt);
+                  setShowPromptEditor(false);
+                }}
                 className="px-6 py-2.5 bg-[#1A1A1A] text-white rounded-xl font-bold text-sm hover:bg-orange-600 transition-all shadow-lg shadow-orange-200/50"
               >
                 Lưu và Đóng
@@ -463,10 +557,16 @@ export default function App() {
                         onClick={() => setSelectedIndex(idx)}
                         className={cn(
                           "w-full h-full object-cover rounded-lg cursor-pointer border-2 transition-all",
-                          selectedIndex === idx ? "border-orange-500 scale-95" : "border-transparent hover:border-orange-200"
+                          selectedIndex === idx ? "border-orange-500 scale-95" : 
+                          failedIndices.includes(idx) ? "border-red-500" : "border-transparent hover:border-orange-200"
                         )}
                         referrerPolicy="no-referrer"
                       />
+                      {failedIndices.includes(idx) && (
+                        <div className="absolute top-1 left-1 bg-red-500 text-white rounded-full p-0.5 shadow-sm pointer-events-none">
+                          <AlertCircle className="w-3 h-3" />
+                        </div>
+                      )}
                       <button 
                         onClick={(e) => { e.stopPropagation(); removeImage(idx); }}
                         className="absolute -top-1 -right-1 w-5 h-5 bg-red-500 text-white rounded-full flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity shadow-sm"
@@ -517,9 +617,23 @@ export default function App() {
               </button>
 
               {error && (
-                <div className="mt-4 p-3 bg-red-50 border border-red-100 rounded-lg flex items-start gap-2 text-red-600 text-xs">
-                  <AlertCircle className="w-4 h-4 shrink-0" />
-                  <p>{error}</p>
+                <div className="mt-4 p-3 bg-red-50 border border-red-100 rounded-lg flex flex-col gap-2 text-red-600 text-xs">
+                  <div className="flex items-start gap-2">
+                    <AlertCircle className="w-4 h-4 shrink-0" />
+                    <p>{error}</p>
+                  </div>
+                  {failedIndices.length > 0 && (
+                    <div className="flex items-center justify-between mt-1 pt-2 border-t border-red-200">
+                      <span className="font-bold">Số ảnh lỗi: {failedIndices.length}</span>
+                      <button 
+                        onClick={retryFailedPrompts}
+                        disabled={loading}
+                        className="flex items-center gap-1 px-2 py-1 bg-red-600 text-white rounded-md hover:bg-red-700 transition-colors disabled:opacity-50"
+                      >
+                        <RotateCcw className="w-3 h-3" /> Thử lại các ảnh lỗi
+                      </button>
+                    </div>
+                  )}
                 </div>
               )}
             </section>
@@ -643,10 +757,22 @@ export default function App() {
         </div>
       </main>
 
-      <footer className="max-w-7xl mx-auto px-4 py-12 border-t border-gray-200 mt-12 text-center">
-        <p className="text-xs text-gray-400 uppercase tracking-widest">
-          Powered by Gemini 3.0 Flash & AdCreative Expert Logic
-        </p>
+      <footer className="max-w-7xl mx-auto px-4 py-16 border-t border-gray-200 mt-12 text-center">
+        <motion.div
+          initial={{ opacity: 0 }}
+          whileInView={{ opacity: 1 }}
+          viewport={{ once: true }}
+          className="flex flex-col items-center gap-4"
+        >
+          <div className="flex items-center gap-2 text-orange-500">
+            <Sparkles className="w-4 h-4" />
+            <span className="text-[10px] font-bold uppercase tracking-[0.4em]">Master Promt By Ival Nguyen</span>
+            <Sparkles className="w-4 h-4" />
+          </div>
+          <p className="text-xs text-gray-400 uppercase tracking-widest">
+            Powered by Gemini 3.0 Flash & Master Promt Expert Logic
+          </p>
+        </motion.div>
       </footer>
 
       <style>{`
